@@ -2588,6 +2588,7 @@ async function getRodada(date, mode){
   try{ return JSON.parse(raw); }catch(e){ return null; }
 }
 async function saveRodada(date, mode, rec){ await sset(`rodada:${date}:${mode}`, JSON.stringify(rec)); }
+async function resetRecord(date, matricula){ await saveRecord(date, matricula, { entrada: null, saida: null }); }
 
 // ---------- cache em memória (é isso que faz "confirmar e ir para o próximo" ser instantâneo) ----------
 // Sem isso, cada clique tinha que buscar de novo, na internet, o registro de TODO MUNDO antes de mostrar o próximo QR.
@@ -2621,6 +2622,9 @@ function invalidateRecordsCache(){ recordsCache = { date: null, byMat: {} }; }
 // ================= APP SHELL =================
 function renderAdmin(tab){
   tab = tab || (APPS_SCRIPT_URL ? 'bater-entrada' : 'config');
+  if(tab !== 'bater-entrada' && tab !== 'bater-saida'){
+    clearInterval(renderPunchMode._poll); // sai da tela de bater ponto: para de atualizar sozinho em segundo plano
+  }
   app.innerHTML = `
     <div class="shell">
       <div class="topbar">
@@ -2750,6 +2754,10 @@ async function renderPunchMode(el, mode){
 
     <div class="card">
       <span class="clock-mini mono" id="miniClock">--:--:--</span>
+      <div class="helper" style="text-align:center;margin-bottom:10px">
+        Atualiza sozinho a cada 10s · <span id="lastSync">--:--:--</span>
+        <button class="btn btn-ghost btn-sm" id="syncNowBtn" style="margin-left:8px">Atualizar agora</button>
+      </div>
       <div class="result-banner idle" id="resultBanner">
         <div class="r-title" id="rTitle">Aguardando</div>
         <div class="r-sub" id="rSub">Ou digite a matrícula abaixo, ou toque no nome na lista</div>
@@ -2771,6 +2779,23 @@ async function renderPunchMode(el, mode){
   clearInterval(renderPunchMode._t);
   renderPunchMode._t = setInterval(tickMiniClock, 1000);
 
+  const syncNow = async () => {
+    invalidateRecordsCache();
+    await renderRodada(mode);
+    await refreshMode(mode);
+    const lastSyncEl = $('#lastSync');
+    if(lastSyncEl) lastSyncEl.textContent = localTime();
+  };
+  const syncNowBtn = $('#syncNowBtn');
+  if(syncNowBtn) syncNowBtn.onclick = syncNow;
+
+  clearInterval(renderPunchMode._poll);
+  renderPunchMode._poll = setInterval(() => {
+    if(document.visibilityState !== 'visible') return; // não gasta chamadas com a tela em segundo plano
+    if(document.activeElement && document.activeElement.id === 'manualMat') return; // não atrapalha quem está digitando a matrícula
+    syncNow();
+  }, 10000);
+
   $('#manualBtn').onclick = () => {
     const v = $('#manualMat').value.trim();
     if(!v) return;
@@ -2782,6 +2807,8 @@ async function renderPunchMode(el, mode){
 
   await renderRodada(mode);
   await refreshMode(mode);
+  const lastSyncEl0 = $('#lastSync');
+  if(lastSyncEl0) lastSyncEl0.textContent = localTime();
 }
 
 async function refreshMode(mode){
@@ -2842,7 +2869,12 @@ async function renderPresent(mode, states){
 
   const pending = states.filter(s => s.state === 'pendente');
   if(pending.length === 0){
-    box.innerHTML = `<div class="present-done-msg">✓ Todos já bateram ${isEntrada ? 'entrada' : 'saída'} hoje</div>`;
+    const bloqueados = states.filter(s => s.state === 'bloqueado');
+    if(bloqueados.length > 0){
+      box.innerHTML = `<div class="present-done-msg" style="color:var(--text-dim)">Ninguém pendente agora. ${bloqueados.length} colaborador(es) ainda não bateram entrada hoje — eles só aparecem aqui depois de bater a entrada.</div>`;
+    } else {
+      box.innerHTML = `<div class="present-done-msg">✓ Todos já bateram ${isEntrada ? 'entrada' : 'saída'} hoje</div>`;
+    }
     return;
   }
 
@@ -3182,7 +3214,9 @@ async function renderRegistros(el){
       <div class="row">
         <div class="field"><label>Data</label><input type="date" id="dateFilter" value="${today}"></div>
         <button class="btn btn-ghost" id="exportBtn">Exportar CSV</button>
+        <button class="btn btn-danger" id="resetDayBtn">Zerar registros do dia</button>
       </div>
+      <div class="helper">"Zerar registros do dia" não apaga colaboradores — só limpa o horário de entrada/saída batido nessa data, como se ninguém tivesse batido ponto ainda. Use para testar ou corrigir um dia.</div>
     </div>
     <div class="card"><div id="regTableWrap"><div class="empty"><span class="spinner"></span> Carregando...</div></div></div>
   `;
@@ -3213,7 +3247,7 @@ async function renderRegistros(el){
     `;
     wrap.innerHTML = (employees.length === 0 ? '<div class="empty">Nenhum colaborador cadastrado.</div>' : rodadaLine + `
       <table>
-        <thead><tr><th>Matrícula</th><th>Nome</th><th>Entrada</th><th>Saída</th><th>Status</th></tr></thead>
+        <thead><tr><th>Matrícula</th><th>Nome</th><th>Entrada</th><th>Saída</th><th>Status</th><th></th></tr></thead>
         <tbody>
           ${rows.map(r=>`
             <tr>
@@ -3222,6 +3256,7 @@ async function renderRegistros(el){
               <td class="mono">${fmtHM(r.entrada)}</td>
               <td class="mono">${fmtHM(r.saida)}</td>
               <td><span class="pill ${r.status}">${r.statusLabel}</span></td>
+              <td style="text-align:right">${(r.entrada || r.saida) ? `<button class="btn btn-ghost btn-sm" data-reset-mat="${r.matricula}">Desfazer</button>` : ''}</td>
             </tr>
           `).join('')}
         </tbody>
@@ -3235,6 +3270,28 @@ async function renderRegistros(el){
       a.download = `ponto_${date}.csv`;
       a.click();
     };
+    $('#resetDayBtn').onclick = async () => {
+      if(employees.length === 0){ toast('Nenhum colaborador cadastrado.'); return; }
+      if(!confirm(`Zerar TODOS os registros de entrada/saída do dia ${date}? Os colaboradores continuam cadastrados, só o ponto batido nesse dia será apagado.`)) return;
+      toast('Zerando registros do dia...');
+      const BATCH_SIZE = 8;
+      for(let i = 0; i < employees.length; i += BATCH_SIZE){
+        const batch = employees.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map(emp => resetRecord(date, sanitize(emp.matricula))));
+      }
+      invalidateRecordsCache();
+      toast('Registros do dia zerados.');
+      load();
+    };
+    wrap.querySelectorAll('[data-reset-mat]').forEach(btn=>{
+      btn.onclick = async () => {
+        if(!confirm('Desfazer o registro de ponto desse colaborador nesse dia?')) return;
+        await resetRecord(date, btn.dataset.resetMat);
+        invalidateRecordsCache();
+        toast('Registro desfeito.');
+        load();
+      };
+    });
   };
   $('#dateFilter').onchange = load;
   load();
